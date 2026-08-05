@@ -1,0 +1,40 @@
+# Python environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Build and packaging output
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Tool caches and reports
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime data and incomplete downloads
+downloads/
+browser-profile/
+.xiaoe-*/
+*.part
+*.part.*
+*.tmp
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
