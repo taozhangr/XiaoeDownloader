@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 import tempfile
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
 from typing import TextIO
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 import imageio_ffmpeg
@@ -31,7 +33,18 @@ WINDOWS_RESERVED = {
 DRM_KEY_FORMATS = ("com.widevine", "com.apple.streamingkeydelivery", "playready")
 EXTINF_PATTERN = re.compile(r"^#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)", re.MULTILINE)
 FFMPEG_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):([0-9.]+)")
+HLS_URI_PATTERN = re.compile(r'URI="([^"]+)"')
+HLS_CONCURRENCY = 8
+HLS_MAX_RETRIES = 3
+HLS_RETRY_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 ProgressCallback = Callable[[DownloadProgress], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _HlsResource:
+    url: str
+    path: Path
+    duration: float = 0.0
 
 
 def safe_filename(value: str, fallback: str = "课程") -> str:
@@ -208,6 +221,279 @@ class MediaDownloader:
                 headers[name] = value
         return headers
 
+    @staticmethod
+    def _can_parallelize_hls(manifest: str) -> bool:
+        """判断播放列表是否是可一次性并发下载的 VOD media playlist。"""
+
+        if "#EXT-X-ENDLIST" not in manifest:
+            return False
+        for raw_line in manifest.splitlines():
+            line = raw_line.strip()
+            if line.startswith(
+                (
+                    "#EXT-X-STREAM-INF",
+                    "#EXT-X-I-FRAME-STREAM-INF",
+                    "#EXT-X-BYTERANGE",
+                )
+            ):
+                return False
+            if line.startswith("#EXT-X-MEDIA:") and "URI=" in line:
+                return False
+        return True
+
+    @staticmethod
+    def _replace_hls_uri(line: str, value: str) -> str:
+        return HLS_URI_PATTERN.sub(f'URI="{value}"', line, count=1)
+
+    def _prepare_parallel_hls_manifest(
+        self,
+        source: MediaSource,
+        manifest: str,
+        temp_dir: Path,
+    ) -> tuple[str, list[_HlsResource]]:
+        """把网络 URI 改成本地文件，并返回需要并发下载的资源清单。"""
+
+        resources: list[_HlsResource] = []
+        segments: list[_HlsResource] = []
+        auxiliary_names: dict[str, str] = {}
+        local_lines: list[str] = []
+        pending_duration = 0.0
+
+        private_key_name: str | None = None
+        if PRIVATE_KEY_PLACEHOLDER in manifest:
+            if source.private_key is None:
+                raise RuntimeError("私有 HLS 播放列表缺少解密密钥。")
+            private_key_name = "key.bin"
+            (temp_dir / private_key_name).write_bytes(source.private_key)
+
+        def localize_auxiliary(uri: str, prefix: str) -> str:
+            if uri.startswith(("data:", "file:")):
+                return uri
+            resolved = urljoin(source.url, uri)
+            local_name = auxiliary_names.get(resolved)
+            if local_name is None:
+                local_name = f"{prefix}_{len(auxiliary_names):06d}.bin"
+                auxiliary_names[resolved] = local_name
+                resource = _HlsResource(resolved, temp_dir / local_name)
+                resources.append(resource)
+            return local_name
+
+        for raw_line in manifest.splitlines():
+            line = raw_line.strip()
+            if not line:
+                local_lines.append("")
+                continue
+
+            if line.startswith("#EXTINF:"):
+                match = EXTINF_PATTERN.match(line)
+                if match:
+                    pending_duration = float(match.group(1))
+                local_lines.append(line)
+                continue
+
+            if line.startswith("#EXT-X-KEY:"):
+                match = HLS_URI_PATTERN.search(line)
+                if match:
+                    uri = match.group(1)
+                    if uri == PRIVATE_KEY_PLACEHOLDER and private_key_name is not None:
+                        local_uri = private_key_name
+                    else:
+                        local_uri = localize_auxiliary(uri, "key")
+                    line = self._replace_hls_uri(line, local_uri)
+                local_lines.append(line)
+                continue
+
+            if line.startswith("#EXT-X-MAP:"):
+                match = HLS_URI_PATTERN.search(line)
+                if match:
+                    local_uri = localize_auxiliary(match.group(1), "init")
+                    line = self._replace_hls_uri(line, local_uri)
+                local_lines.append(line)
+                continue
+
+            if line.startswith("#"):
+                local_lines.append(line)
+                continue
+
+            segment_name = f"segment_{len(segments):06d}.bin"
+            segment = _HlsResource(
+                urljoin(source.url, line),
+                temp_dir / segment_name,
+                pending_duration,
+            )
+            segments.append(segment)
+            resources.append(segment)
+            local_lines.append(segment_name)
+            pending_duration = 0.0
+
+        if not segments:
+            raise RuntimeError("HLS 播放列表中没有找到媒体分片。")
+        return "\n".join(local_lines) + "\n", resources
+
+    @staticmethod
+    def _is_retryable_hls_error(error: Exception) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code in HLS_RETRY_STATUS_CODES
+        return isinstance(error, (httpx.HTTPError, OSError, RuntimeError))
+
+    @staticmethod
+    def _hls_error_detail(error: Exception) -> str:
+        if isinstance(error, httpx.HTTPStatusError):
+            return f"HTTP {error.response.status_code}"
+        if isinstance(error, httpx.TimeoutException):
+            return "请求超时"
+        if isinstance(error, OSError):
+            return str(error)
+        return type(error).__name__
+
+    async def _download_hls_resources_async(
+        self,
+        resources: list[_HlsResource],
+        headers: dict[str, str],
+        tracker: _ProgressTracker,
+    ) -> None:
+        limits = httpx.Limits(
+            max_connections=HLS_CONCURRENCY,
+            max_keepalive_connections=HLS_CONCURRENCY,
+        )
+        timeout = httpx.Timeout(30, read=None)
+        completed_bytes = 0
+        completed_duration = 0.0
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers=headers,
+            http2=False,
+            limits=limits,
+            timeout=timeout,
+            verify=False,
+        ) as client:
+
+            async def download_one(resource: _HlsResource) -> None:
+                nonlocal completed_bytes, completed_duration
+                partial = resource.path.with_name(resource.path.name + ".part")
+                for attempt in range(HLS_MAX_RETRIES + 1):
+                    received_bytes = 0
+                    try:
+                        async with client.stream("GET", resource.url) as response:
+                            response.raise_for_status()
+                            with partial.open("wb") as stream:
+                                async for chunk in response.aiter_bytes(1024 * 1024):
+                                    if not chunk:
+                                        continue
+                                    stream.write(chunk)
+                                    received_bytes += len(chunk)
+                                    tracker.report(
+                                        completed_bytes + received_bytes,
+                                        completed_duration=completed_duration,
+                                    )
+                        if received_bytes <= 0:
+                            raise RuntimeError("服务器返回了空分片")
+                        partial.replace(resource.path)
+                        completed_bytes += received_bytes
+                        completed_duration += resource.duration
+                        tracker.report(
+                            completed_bytes,
+                            completed_duration=completed_duration,
+                        )
+                        return
+                    except asyncio.CancelledError:
+                        partial.unlink(missing_ok=True)
+                        raise
+                    except Exception as error:
+                        partial.unlink(missing_ok=True)
+                        tracker.report(
+                            completed_bytes,
+                            completed_duration=completed_duration,
+                        )
+                        if attempt >= HLS_MAX_RETRIES or not self._is_retryable_hls_error(error):
+                            raise RuntimeError(
+                                f"HLS 分片下载失败：{resource.path.name}，"
+                                f"{self._hls_error_detail(error)}"
+                            ) from error
+                        await asyncio.sleep(min(2**attempt, 8))
+
+            tasks = [asyncio.create_task(download_one(resource)) for resource in resources]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+    def _download_hls_resources(
+        self,
+        resources: list[_HlsResource],
+        headers: dict[str, str],
+        tracker: _ProgressTracker,
+    ) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._download_hls_resources_async(resources, headers, tracker))
+            return
+
+        # Playwright 的同步 API 会在当前线程维持一个 asyncio 事件循环，
+        # 因此不能在这里再次调用 asyncio.run()。下载接口仍需同步阻塞，
+        # 将并发 HLS 请求放到独立线程的事件循环中执行。
+        errors: list[BaseException] = []
+
+        def run_in_thread() -> None:
+            try:
+                asyncio.run(self._download_hls_resources_async(resources, headers, tracker))
+            except BaseException as error:
+                errors.append(error)
+
+        worker = Thread(target=run_in_thread, name="xiaoe-hls-downloader")
+        worker.start()
+        worker.join()
+        if errors:
+            raise errors[0]
+
+    def _ffmpeg_command(
+        self,
+        input_value: str,
+        partial: Path,
+        headers: dict[str, str],
+        *,
+        local_manifest: bool,
+    ) -> list[str]:
+        command = [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-y",
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls,crypto,data",
+            "-http_multiple",
+            "1",
+        ]
+        if not local_manifest:
+            header_block = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+            if header_block:
+                command.extend(("-headers", header_block))
+        command.extend(
+            (
+                "-allowed_extensions",
+                "ALL",
+                "-i",
+                input_value,
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(partial),
+            )
+        )
+        return command
+
     def _download_file(
         self,
         source: MediaSource,
@@ -285,50 +571,39 @@ class MediaDownloader:
         try:
             with tempfile.TemporaryDirectory(prefix=".xiaoe-", dir=self.output_dir) as temp_value:
                 temp_dir = Path(temp_value)
-                input_value = source.url
-                if source.manifest_text is not None:
-                    if PRIVATE_KEY_PLACEHOLDER in manifest:
-                        if source.private_key is None:
-                            raise RuntimeError("私有 HLS 播放列表缺少解密密钥。")
-                        key_path = temp_dir / "key.bin"
-                        key_path.write_bytes(source.private_key)
-                        manifest = manifest.replace(PRIVATE_KEY_PLACEHOLDER, key_path.name)
-                    manifest_path = temp_dir / "index.m3u8"
-                    manifest_path.write_text(manifest, encoding="utf-8", newline="\n")
-                    input_value = str(manifest_path)
-
-                header_block = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
-                command = [
-                    imageio_ffmpeg.get_ffmpeg_exe(),
-                    "-hide_banner",
-                    "-loglevel",
-                    "info",
-                    "-progress",
-                    "pipe:1",
-                    "-nostats",
-                    "-y",
-                    "-protocol_whitelist",
-                    "file,http,https,tcp,tls,crypto,data",
-                ]
-                # ffmpeg 不能把 HTTP 的 -headers 选项应用到本地 m3u8 输入，私有
-                # 播放列表中的 CDN 分片已带签名，不需要额外请求头。
-                if header_block and source.manifest_text is None:
-                    command.extend(("-headers", header_block))
-                command.extend(
-                    (
-                        "-allowed_extensions",
-                        "ALL",
-                        "-i",
-                        input_value,
-                        "-map",
-                        "0",
-                        "-c",
-                        "copy",
-                        "-movflags",
-                        "+faststart",
-                        str(partial),
+                if self._can_parallelize_hls(manifest):
+                    local_manifest, resources = self._prepare_parallel_hls_manifest(
+                        source,
+                        manifest,
+                        temp_dir,
                     )
-                )
+                    manifest_path = temp_dir / "index.m3u8"
+                    manifest_path.write_text(local_manifest, encoding="utf-8", newline="\n")
+                    self._download_hls_resources(resources, headers, tracker)
+                    command = self._ffmpeg_command(
+                        str(manifest_path),
+                        partial,
+                        headers,
+                        local_manifest=True,
+                    )
+                else:
+                    input_value = source.url
+                    if source.manifest_text is not None:
+                        if PRIVATE_KEY_PLACEHOLDER in manifest:
+                            if source.private_key is None:
+                                raise RuntimeError("私有 HLS 播放列表缺少解密密钥。")
+                            key_path = temp_dir / "key.bin"
+                            key_path.write_bytes(source.private_key)
+                            manifest = manifest.replace(PRIVATE_KEY_PLACEHOLDER, key_path.name)
+                        manifest_path = temp_dir / "index.m3u8"
+                        manifest_path.write_text(manifest, encoding="utf-8", newline="\n")
+                        input_value = str(manifest_path)
+                    command = self._ffmpeg_command(
+                        input_value,
+                        partial,
+                        headers,
+                        local_manifest=source.manifest_text is not None,
+                    )
                 return_code, error_lines = self._run_ffmpeg(
                     command,
                     partial,
